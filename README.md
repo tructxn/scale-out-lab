@@ -1,23 +1,25 @@
-# Scale-out Lab — vì sao pod mới lên mà không gánh được tải
+# Scale-out Lab: why new pods don't take the load
 
-> **Câu hỏi nghiên cứu:** Khi traffic spike làm HPA scale-out một service JVM (Vert.x) trên Kubernetes, vì sao pod mới không giảm tải cho pod cũ — và biện pháp nào thật sự sửa được, đo bằng số liệu?
+> **Research question:** When a traffic spike makes the HPA scale out a JVM (Vert.x) service on Kubernetes, why don't the new pods take load off the old ones? Which fixes actually work, as shown by measurements?
 
-Bối cảnh: triệu chứng hay gặp ở production — *high traffic → CPU tăng → scale, nhưng traffic đã dồn ở pod cũ, pod mới lên không giải quyết gì*.
-Nền lý thuyết: queueing (Erlang C) — khi utilization → 100%, thời gian chờ tăng phi tuyến.
+Context: a common production symptom. *High traffic → CPU rises → HPA scales out, but traffic has already piled up on the old pods, so the new pods don't help.*
+Theory: queueing (Erlang C). As utilization approaches 100%, waiting time grows non-linearly.
+
+**Status:** M0 done. The GitHub-hosted runner provides 4 vCPU, 16 GB, a kernel with BTF, and working bpftrace and kind ([workflow](.github/workflows/m0-env-check.yml)).
 
 ---
 
-## 1. Giả thuyết
+## 1. Hypotheses
 
-| # | Giả thuyết | Dự đoán đo được |
+| # | Hypothesis | Measurable prediction |
 |---|---|---|
-| **H1** | **Connection pinning** — kube-proxy cân bằng *theo connection*; pool keep-alive của caller đã mở sẵn tới pod cũ | Sau scale, RPS/pod lệch mạnh: pod cũ ≫ pod mới |
-| **H2** | **Hàng đợi không giới hạn** ở pod cũ — request đã xếp hàng không chuyển được sang pod mới | RPS đều nhưng p99 pod cũ vẫn cao; event-loop delay / pending queue tăng |
-| **H3** | **Scale quá muộn** — CPU là chỉ số trễ, chuỗi HPA dài | Khoảng `spike start → pod mới phục vụ` dài hơn thời gian spike gây hại |
-| **H4** | **JIT lạnh** — pod mới Ready nhanh nhưng chậm trong N giây đầu | p99 pod mới cao trong 10–60 s đầu rồi hội tụ |
-| **H5** | **CPU throttling** (cgroup limit) làm pod cũ chậm trước khi CPU "tới 100%" | `container_cpu_cfs_throttled_periods_total` tăng cùng lúc p99 tăng |
+| **H1** | **Connection pinning.** kube-proxy balances *per connection*, and the caller's keep-alive pool already holds connections to the old pods. | After scale-out, RPS per pod is heavily skewed: old pods ≫ new pods |
+| **H2** | **Unbounded queues** on old pods. Requests already queued cannot move to new pods. | RPS is even, but old-pod p99 stays high, and event-loop delay and the pending queue grow |
+| **H3** | **Scaling too late.** CPU is a lagging signal, and the HPA chain is long. | `spike start → new pod serving` takes longer than the window in which the spike does damage |
+| **H4** | **Cold JIT.** New pods become Ready fast but stay slow for the first N seconds. | New-pod p99 is high for the first 10–60 s, then converges |
+| **H5** | **CPU throttling** (cgroup limit) slows old pods before CPU "hits 100%". | `container_cpu_cfs_throttled_periods_total` rises together with p99 |
 
-Mỗi kịch bản bên dưới **chứng minh hoặc bác bỏ** một giả thuyết — không phải demo.
+Each scenario below is meant to **confirm or refute** a hypothesis. None of them is a demo.
 
 ---
 
@@ -25,120 +27,121 @@ Mỗi kịch bản bên dưới **chứng minh hoặc bác bỏ** một giả th
 
 ```mermaid
 flowchart LR
-    LG[k6<br/>open-model<br/>constant-arrival-rate] --> CALLER
-    subgraph K8s["kind / k3s cluster"]
-        CALLER[caller<br/>Vert.x WebClient<br/>= mô phỏng gateway] -->|keep-alive pool| SVC[Service<br/>kube-proxy]
+    LG[k6<br/>open model<br/>constant-arrival-rate] --> CALLER
+    subgraph K8s["kind cluster"]
+        CALLER[caller<br/>Vert.x WebClient<br/>= gateway stand-in] -->|keep-alive pool| SVC[Service<br/>kube-proxy]
         SVC --> P1[callee pod 1]
         SVC --> P2[callee pod 2]
-        SVC -.->|sau scale| PN[callee pod N mới]
+        SVC -.->|after scale-out| PN[new callee pod N]
         HPA[HPA] -.->|scale| PN
         PROM[(Prometheus)] -.-> P1 & P2 & PN & CALLER
     end
-    PROM --> G[Grafana / export CSV]
+    PROM --> G[Grafana / CSV export]
 ```
 
-- **callee**: Vert.x HTTP server, handler tốn CPU có thể chỉnh (`WORK_US` = số µs CPU mỗi request) → kiểm soát được capacity mỗi pod.
-- **caller**: Vert.x `WebClient` với connection pool — đây là nơi pinning xảy ra, giống gateway/service-to-service thật.
-- **Load generator phải là open model** (k6 `constant-arrival-rate` hoặc wrk2). Closed model (wrk, ab) tự giảm tải khi server chậm → giấu mất hàng đợi (*coordinated omission*).
+- **callee:** a Vert.x HTTP server with a tunable CPU cost per request (`WORK_US` = µs of CPU per request), so the capacity of each pod is controlled.
+- **caller:** a Vert.x `WebClient` with a connection pool. This is where pinning happens, as in a real gateway or service-to-service call.
+- **The load generator must be open-model** (k6 `constant-arrival-rate`, or wrk2). Closed-model tools such as wrk and ab back off when the server slows down, which hides the queue (*coordinated omission*).
 
 ---
 
-## 3. Metric bắt buộc
+## 3. Required metrics
 
-| Nhóm | Metric | Nguồn |
+| Group | Metric | Source |
 |---|---|---|
-| Phân bố tải | RPS **mỗi pod**, số connection đang mở **mỗi pod** | Micrometer (Vert.x metrics) |
-| Latency | p50/p99 **mỗi pod** (server-side histogram) + p99 phía client (k6) | Micrometer, k6 |
-| Hàng đợi | event-loop delay, pending request của caller pool, request in-flight | Vert.x metrics |
+| Load distribution | RPS **per pod**, open connections **per pod** | Micrometer (Vert.x metrics) |
+| Latency | p50/p99 **per pod** (server-side histogram), plus client-side p99 (k6) | Micrometer, k6 |
+| Queueing | event-loop delay, caller-pool pending requests, in-flight requests | Vert.x metrics |
 | CPU | usage, **throttled periods** | cAdvisor |
-| Scale timeline | thời điểm: spike bắt đầu, HPA desired thay đổi, pod Ready, pod nhận request đầu tiên | k8s events + log |
-| Lỗi | 5xx, timeout, connection refused | k6, caller |
+| Scale timeline | timestamps for: spike start, HPA desired-replicas change, pod Ready, first request served by a new pod | k8s events, logs |
+| Errors | 5xx, timeouts, connection refused | k6, caller |
 
-⚠️ Tên metric Vert.x/Micrometer cụ thể cần tra theo version dùng — chưa cố định ở đây.
+⚠️ Exact Vert.x/Micrometer metric names depend on the version used, so they are not fixed here yet.
 
-### 3b. Tầng kernel — eBPF
+### 3b. Kernel layer: eBPF
 
-eBPF chạy ở **kernel của node**, không chạy trong pod: triển khai dạng DaemonSet privileged, lọc theo cgroup/pod.
-Vai trò: **kiểm chứng độc lập** với metric của app (app có thể đo sai hoặc không thấy hàng đợi trước khi request vào tới code).
+eBPF runs in the **node's kernel**, not inside the pod. It is deployed as a privileged DaemonSet and filtered by cgroup or pod.
+Its role is **independent verification** of the app metrics. The app can mismeasure, and it cannot see queueing that happens before a request reaches app code.
 
-| Giả thuyết | Câu hỏi kernel trả lời được | Công cụ |
+| Hypothesis | What the kernel can tell us | Tool |
 |---|---|---|
-| H1 pinning | Connection TCP nào mở tới pod nào, sống bao lâu, bao nhiêu byte | `tcplife`, `tcpconnect`/`tcpaccept` |
-| H2 queue | Request có kẹt **trước khi vào app** không — accept queue tràn, backlog | `nstat` (`TcpExtListenOverflows`), `ss -lnt` (Recv-Q) — không phải eBPF nhưng bắt buộc đi kèm |
-| H2/H5 | Event-loop thread chờ CPU bao lâu (run-queue latency), thời gian off-CPU | `runqlat`, `offcputime` |
-| H5 throttling | Throttle xảy ra đúng lúc p99 tăng? | cgroup `cpu.stat` (`nr_throttled`) + `runqlat` theo cgroup |
-| Mạng | Retransmit, drop | `tcpretrans`, `tcpdrop` |
+| H1 pinning | Which TCP connections go to which pod, how long they live, how many bytes they carry | `tcplife`, `tcpconnect`/`tcpaccept` |
+| H2 queueing | Whether requests are stuck **before reaching the app**: accept-queue overflow, backlog | `nstat` (`TcpExtListenOverflows`), `ss -lnt` (Recv-Q). These are not eBPF, but they are required alongside it. |
+| H2/H5 | How long event-loop threads wait for a CPU (run-queue latency), and off-CPU time | `runqlat`, `offcputime` |
+| H5 throttling | Whether throttling coincides with p99 spikes | cgroup `cpu.stat` (`nr_throttled`), plus per-cgroup `runqlat` |
+| Network | Retransmits, drops | `tcpretrans`, `tcpdrop` |
 
-**Cách triển khai (chọn 1):**
-- **Inspektor Gadget** (`kubectl gadget ...`) — eBPF gadget có sẵn, tự gắn metadata pod/namespace. Lựa chọn mặc định. ⚠️ *Tên gadget đã đổi giữa các version — tra docs version cài.*
-- **bpftrace / BCC** chạy trên node — linh hoạt nhất, tự lọc theo cgroup.
-- **Parca / Pyroscope (eBPF agent)** — continuous CPU profiling toàn cluster (tuỳ chọn, ở M4+).
+**Deployment (pick one):**
+- **Inspektor Gadget** (`kubectl gadget ...`): ready-made eBPF gadgets with pod and namespace metadata. This is the default. ⚠️ *Gadget names changed between versions, so check the docs for the installed version.*
+- **bpftrace / BCC** on the node: the most flexible option. Filtering by cgroup is done manually.
+- **Parca / Pyroscope (eBPF agent):** continuous cluster-wide CPU profiling (optional, M4+).
 
-**Giới hạn:**
-- Stack Java JIT qua eBPF hiện ra **không có tên hàm** nếu không có perf-map. Profile CPU của JVM → dùng **async-profiler**; eBPF dành cho kernel / scheduler / TCP.
-- **eBPF cần kernel Linux thật có BTF.** kind trên Docker Desktop (macOS) dùng kernel của VM — ⚠️ *chưa kiểm chứng có đủ BTF/quyền*. Phần đo chính chạy trên **GitHub Actions** (Ubuntu runner, 4 vCPU / 16 GB).
-- Overhead: tracing per-packet/per-syscall ở tải cao có thể làm méo số liệu → chạy 1 lần có eBPF để chẩn đoán, các lần đo chính tắt eBPF.
+**Limits:**
+- Java JIT frames show up **without symbols** in eBPF stacks unless a perf map is available. Use **async-profiler** for JVM CPU profiling, and eBPF for kernel, scheduler, and TCP.
+- **eBPF needs a real Linux kernel with BTF.** kind on Docker Desktop (macOS) uses the VM's kernel, which may lack it. The main runs therefore use **GitHub Actions** (Ubuntu runner), where BTF is verified in M0.
+- Overhead: per-packet or per-syscall tracing under high load can distort results. Use eBPF in separate diagnostic runs, and turn it off for the main measurement runs.
+- The runner itself is noisy (the runner agent alone made ~5.5k syscalls in 5 s in M0), so always filter by the pod's cgroup.
 
 ---
 
-## 4. Kịch bản
+## 4. Scenarios
 
-Mỗi kịch bản: **≥ 5 lần chạy**, báo cáo median + khoảng (min–max). Không kết luận từ 1 lần chạy.
+For each scenario: **≥ 5 runs**, reporting the median and the range (min–max). No conclusions are drawn from a single run.
 
-| ID | Kịch bản | Thay đổi so với baseline | Kiểm tra | Tiêu chí "sửa được" |
+| ID | Scenario | Change vs. baseline | Tests | "Fixed" criterion |
 |---|---|---|---|---|
-| **S0** | Baseline ổn định | N pod cố định, tải đều, không scale | Phân bố có đều khi *không* scale? | RPS/pod lệch < 10% |
-| **S1** | Spike + HPA theo CPU | Tải ×3 trong 5 phút, pool keep-alive mặc định | H1, H3 | — (đây là "bệnh") |
-| **S2** | Giới hạn tuổi thọ connection | Caller pool: keep-alive timeout / max lifetime ngắn ⚠️ *tên option theo version* | H1 | RPS pod mới đạt ≥ 80% pod cũ trong X giây |
-| **S3** | L7 load balancing | Envoy giữa caller và callee, `LEAST_REQUEST` | H1 | Như S2, so sánh overhead latency của Envoy |
-| **S4** | Admission control | Callee giới hạn in-flight, vượt → 503 nhanh; caller giới hạn wait queue | H2 | p99 pod cũ bị chặn trên; lỗi 503 được retry sang pod khác |
-| **S5** | Scale theo chỉ số dẫn trước | HPA theo RPS / in-flight (prometheus-adapter hoặc KEDA) + `behavior.scaleUp` nhanh | H3 | Thời gian spike → pod mới phục vụ giảm |
-| **S6** | JIT warmup | So p99 pod mới 60 s đầu; thử bắn warmup request trước khi báo Ready | H4 | p99 60 s đầu tiến gần trạng thái ổn định |
-| **S7** | CPU limit vs không limit | Cùng S1, bỏ CPU limit hoặc tăng limit | H5 | Throttling biến mất → p99 thay đổi bao nhiêu |
-| **S8** | Kết hợp tốt nhất | Tổ hợp biện pháp thắng từ S2–S7 | Tất cả | So S1: p99 toàn hệ thống, lỗi, thời gian hồi phục |
+| **S0** | Steady baseline | N fixed pods, even load, no scaling | Is the distribution even *without* scaling? | RPS skew per pod < 10% |
+| **S1** | Spike + CPU-based HPA | 3× load for 5 min, default keep-alive pool | H1, H3 | None. This scenario reproduces the problem. |
+| **S2** | Bounded connection lifetime | Caller pool: short keep-alive timeout or max lifetime ⚠️ *option names depend on the version* | H1 | New pods reach ≥ 80% of old-pod RPS within X s |
+| **S3** | L7 load balancing | Envoy between caller and callee, `LEAST_REQUEST` | H1 | Same as S2, plus Envoy's latency overhead |
+| **S4** | Admission control | Callee caps in-flight requests and returns a fast 503 above the cap. Caller caps its wait queue. | H2 | Old-pod p99 is bounded, and 503s are retried on other pods |
+| **S5** | Leading-signal scaling | HPA on RPS or in-flight requests (prometheus-adapter or KEDA), plus an aggressive `behavior.scaleUp` | H3 | Shorter time from spike to new pod serving |
+| **S6** | JIT warm-up | Compare new-pod p99 in the first 60 s; try warm-up requests before reporting Ready | H4 | First-60 s p99 close to steady state |
+| **S7** | CPU limit vs. no limit | Same as S1, with the CPU limit removed or raised | H5 | Throttling gone; measure how much p99 changes |
+| **S8** | Best combination | The winning fixes from S2–S7 combined | All | vs. S1: system p99, errors, recovery time |
 
 ---
 
-## 5. Cấu trúc repo
+## 5. Repo layout
 
 ```
 scale-out-lab/
-├── README.md              # câu hỏi, kết quả chính, cách chạy
+├── README.md              # question, headline results, how to run
 ├── apps/
-│   ├── callee/            # Vert.x server, WORK_US chỉnh được
-│   └── caller/            # Vert.x WebClient, pool option qua env
+│   ├── callee/            # Vert.x server, tunable WORK_US
+│   └── caller/            # Vert.x WebClient, pool options via env
 ├── k8s/
 │   ├── base/              # Deployment, Service, HPA
 │   └── overlays/          # s1..s8 (kustomize)
 ├── load/                  # k6 scripts (open model)
 ├── observability/         # Prometheus, Grafana dashboard
 ├── scripts/
-│   ├── run-scenario.sh    # chạy 1 kịch bản × N lần, thu kết quả
+│   ├── run-scenario.sh    # run one scenario × N times, collect results
 │   └── export.sh          # Prometheus → CSV
 ├── results/<date>-<scenario>/  # raw CSV + summary.md
-└── analysis/              # notebook/script vẽ chart từ CSV
+└── analysis/              # scripts that chart the CSVs
 ```
 
 ---
 
 ## 6. Milestones
 
-| M | Việc | Đầu ra | Ước lượng |
+| M | Work | Output | Estimate |
 |---|---|---|---|
-| **M0** | Lab: cluster + Prometheus + k6 chạy được (Linux, để eBPF chạy được) | 1 dashboard thấy RPS/pod + 1 lần `tcplife` thấy connection theo pod | 1–2 buổi |
-| **M1** | callee + caller + S0 | S0 phân bố đều — xác nhận đo đúng | 1–2 buổi |
-| **M2** | S1 tái hiện được "bệnh" | Chart RPS/pod + p99/pod quanh lúc scale | 1–2 buổi |
-| **M3** | S2–S4 (connection + queue) | Bảng so sánh với S1 | 2–3 buổi |
-| **M4** | S5–S7 (scale signal, JIT, throttling) | Bảng so sánh | 2–3 buổi |
-| **M5** | S8 + write-up | Bài viết + chart + giới hạn của nghiên cứu | 1–2 buổi |
+| **M0** ✅ | Lab environment: a cluster, eBPF, and a runner check | Runner verified: 4 vCPU / 16 GB, BTF, bpftrace, kind | 1–2 sessions |
+| **M1** | callee + caller + Prometheus + k6 + S0 | Even distribution in S0, which confirms the measurement setup | 1–2 sessions |
+| **M2** | S1 reproduces the problem | Charts of RPS per pod and p99 per pod around the scale-out | 1–2 sessions |
+| **M3** | S2–S4 (connections + queueing) | Comparison table vs. S1 | 2–3 sessions |
+| **M4** | S5–S7 (scale signal, JIT, throttling) | Comparison table | 2–3 sessions |
+| **M5** | S8 + write-up | Article, charts, and the study's limitations | 1–2 sessions |
 
-**Quy tắc dừng:** nếu M2 không tái hiện được bệnh → dừng, ghi lại vì sao (đó cũng là kết quả).
+**Stop rule:** if M2 cannot reproduce the problem, stop and document why. That is also a result.
 
 ---
 
-## 7. Giới hạn cần ghi sẵn trong write-up
+## 7. Known limitations (to state in the write-up)
 
-- Lab ≠ production: 1 máy, mạng loopback, không có service mesh/ingress thật.
-- kind trên macOS chạy trong VM Docker — CPU/throttling khác Linux thật; số liệu S7 nên chạy lại trên Linux.
-- GitHub-hosted runner là máy dùng chung (noisy neighbour) → phương sai cao hơn máy riêng; luôn chạy nhiều lần, báo cáo khoảng.
-- Repo chỉ tái hiện **cơ chế**, không chứa dữ liệu/cấu hình của hệ thống production nào.
+- The lab is not production: a single machine, loopback networking, and no real service mesh or ingress.
+- kind on macOS runs inside a Docker VM, so CPU and throttling behaviour differ from bare Linux. Re-run S7 on Linux.
+- GitHub-hosted runners are shared machines (noisy neighbours), so variance is higher than on dedicated hardware. Always do multiple runs and report ranges.
+- The repo reproduces **mechanisms** only. It contains no data or configuration from any production system.
