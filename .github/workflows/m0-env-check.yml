@@ -1,0 +1,33 @@
+name: M0 env check
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  env-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Machine
+        run: |
+          uname -a
+          nproc
+          free -h
+          ls -l /sys/kernel/btf/vmlinux
+
+      - name: Install bpftrace
+        run: sudo apt-get update -q && sudo apt-get install -y -q bpftrace
+
+      - name: eBPF smoke test (top syscalls by process, 5s)
+        run: |
+          sudo bpftrace -e '
+            tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }
+            interval:s:5 { print(@, 10); clear(@); exit(); }'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Cluster check
+        run: kubectl get nodes -o wide
