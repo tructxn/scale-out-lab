@@ -46,6 +46,7 @@ spec:
       containers:
         - name: k6
           image: grafana/k6:0.52.0
+          imagePullPolicy: IfNotPresent
           args: [run, --quiet, /scripts/constant.js]
           env:
             - { name: RATE, value: "$RATE" }

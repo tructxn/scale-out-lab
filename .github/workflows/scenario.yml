@@ -32,6 +32,8 @@ jobs:
         run: |
           docker build -q -t scale-out-lab:dev apps
           kind load docker-image scale-out-lab:dev --name lab
+          # Pre-load the load generator so image pull time never lands inside a measurement.
+          docker pull -q grafana/k6:0.52.0 && kind load docker-image grafana/k6:0.52.0 --name lab
           kubectl apply -f k8s/base
           for d in prometheus callee caller; do kubectl rollout status deploy/$d --timeout=180s; done
 
@@ -42,6 +44,13 @@ jobs:
           RATE: ${{ inputs.rate || '600' }}
           DURATION: ${{ inputs.duration || '30s' }}
         run: scripts/run-scenario.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe pod -l job-name=k6 | tail -30
+          kubectl logs job/k6 --tail=30 || true
 
       - name: Summary
         if: always()
