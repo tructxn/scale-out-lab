@@ -5,8 +5,30 @@
 Context: a common production symptom. *High traffic → CPU rises → HPA scales out, but traffic has already piled up on the old pods, so the new pods don't help.*
 Theory: queueing (Erlang C). As utilization approaches 100%, waiting time grows non-linearly.
 
-**Status:** M0 done. The GitHub-hosted runner provides 4 vCPU, 16 GB, a kernel with BTF, and working bpftrace and kind ([workflow](.github/workflows/m0-env-check.yml)).
+**Status:** M1 done. callee/caller apps, Prometheus, k6 and the S0 runner work locally (kind) and in CI.
 
+**First finding (S0, no scaling, 3 callee pods, 600 req/s):** requests are already heavily skewed across pods, while open connections are spread evenly.
+
+| Where | Requests per pod | Skew | Open connections per pod |
+|---|---|---:|---|
+| local kind, run 1 | 5,807 / 12,913 / 254 | 200% | 10 / 5 / 8 |
+| local kind, run 2 | 3,192 / 1,137 / 13,860 | 210% | 8 / 10 / 5 |
+| GitHub runner | 541 / 11,975 / 6,382 | 182% | 9 / 7 / 7 |
+
+The pod with the *fewest* connections can take the most requests, so connection count alone does not explain the skew. Working hypothesis (**unverified**): at low concurrency the caller's pool keeps reusing a few "hot" connections. Next step: count requests per connection.
+
+## How to run
+
+```bash
+# local (needs Java 21, Maven, Docker, kind, kubectl, jq)
+mvn -q -f apps/pom.xml package
+kind create cluster --name lab
+docker build -t scale-out-lab:dev apps && kind load docker-image scale-out-lab:dev --name lab
+kubectl apply -f k8s/base
+RUNS=1 DURATION=30s scripts/run-scenario.sh      # writes results/<date>-s0/summary.md
+```
+
+CI ([scenario.yml](.github/workflows/scenario.yml)): every push runs a smoke test (1 run × 30 s, ~3–4 min). For real measurements, run the workflow manually (default 5 runs × 60 s).
 ---
 
 ## 1. Hypotheses
@@ -107,9 +129,7 @@ For each scenario: **≥ 5 runs**, reporting the median and the range (min–max
 ```
 scale-out-lab/
 ├── README.md              # question, headline results, how to run
-├── apps/
-│   ├── callee/            # Vert.x server, tunable WORK_US
-│   └── caller/            # Vert.x WebClient, pool options via env
+├── apps/                  # one Vert.x jar/image; ROLE=callee (tunable WORK_US) or ROLE=caller (pooled HttpClient)
 ├── k8s/
 │   ├── base/              # Deployment, Service, HPA
 │   └── overlays/          # s1..s8 (kustomize)
@@ -129,7 +149,7 @@ scale-out-lab/
 | M | Work | Output | Estimate |
 |---|---|---|---|
 | **M0** ✅ | Lab environment: a cluster, eBPF, and a runner check | Runner verified: 4 vCPU / 16 GB, BTF, bpftrace, kind | 1–2 sessions |
-| **M1** | callee + caller + Prometheus + k6 + S0 | Even distribution in S0, which confirms the measurement setup | 1–2 sessions |
+| **M1** ✅ | callee + caller + Prometheus + k6 + S0 | Measurement setup works. S0 is **not** even (~200% skew), see Status | 1–2 sessions |
 | **M2** | S1 reproduces the problem | Charts of RPS per pod and p99 per pod around the scale-out | 1–2 sessions |
 | **M3** | S2–S4 (connections + queueing) | Comparison table vs. S1 | 2–3 sessions |
 | **M4** | S5–S7 (scale signal, JIT, throttling) | Comparison table | 2–3 sessions |
