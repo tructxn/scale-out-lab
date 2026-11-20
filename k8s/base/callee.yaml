@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: callee
 spec:
+  # Recreate: all pods of a run start together, and no surge pod competes for the 4-vCPU runner.
+  strategy: { type: Recreate }
   replicas: 3
   selector:
     matchLabels: { app: callee }

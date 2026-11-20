@@ -52,6 +52,7 @@ spec:
             - { name: RATE, value: "$RATE" }
             - { name: DURATION, value: "$DURATION" }
           resources:
+            requests: { cpu: 500m, memory: 256Mi }
             limits: { cpu: "1", memory: 512Mi }
           volumeMounts:
             - { name: scripts, mountPath: /scripts }

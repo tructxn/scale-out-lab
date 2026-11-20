@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: caller
 spec:
+  # Recreate: all pods of a run start together, and no surge pod competes for the 4-vCPU runner.
+  strategy: { type: Recreate }
   replicas: 1
   selector:
     matchLabels: { app: caller }
@@ -26,7 +28,7 @@ spec:
             httpGet: { path: /health, port: http }
             periodSeconds: 2
           resources:
-            requests: { cpu: "1", memory: 256Mi }
+            requests: { cpu: 500m, memory: 256Mi } # request < limit so it fits next to k6 on a 4-vCPU runner
             limits: { cpu: "1", memory: 256Mi }
 ---
 apiVersion: v1
