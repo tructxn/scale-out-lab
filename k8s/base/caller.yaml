@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caller
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: caller }
+  template:
+    metadata:
+      labels: { app: caller }
+      annotations: { prometheus.io/scrape: "true" }
+    spec:
+      enableServiceLinks: false # else k8s injects CALLEE_PORT=tcp://... and clobbers our config
+      containers:
+        - name: app
+          image: scale-out-lab:dev
+          imagePullPolicy: Never
+          env:
+            - { name: ROLE, value: caller }
+            - { name: CALLEE_HOST, value: callee }
+            - { name: POOL_SIZE, value: "20" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits: { cpu: "1", memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caller
+spec:
+  selector: { app: caller }
+  ports:
+    - { port: 8080, targetPort: http }

@@ -1,0 +1,52 @@
+name: Scenario
+
+# Push = quick smoke (1 run x 30s). Real measurements: run manually with runs=5.
+on:
+  push:
+    branches: [main]
+    paths: [apps/**, k8s/**, load/**, scripts/**, .github/workflows/scenario.yml]
+  workflow_dispatch:
+    inputs:
+      scenario: { description: Scenario id, default: s0 }
+      runs: { description: Runs, default: "5" }
+      rate: { description: Requests per second, default: "600" }
+      duration: { description: Load duration per run, default: 60s }
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21", cache: maven }
+
+      - name: Build jar
+        run: mvn -q -B -f apps/pom.xml package
+
+      - uses: helm/kind-action@v1
+        with: { cluster_name: lab }
+
+      - name: Build image and deploy
+        run: |
+          docker build -q -t scale-out-lab:dev apps
+          kind load docker-image scale-out-lab:dev --name lab
+          kubectl apply -f k8s/base
+          for d in prometheus callee caller; do kubectl rollout status deploy/$d --timeout=180s; done
+
+      - name: Run scenario
+        env:
+          SCENARIO: ${{ inputs.scenario || 's0' }}
+          RUNS: ${{ inputs.runs || '1' }}
+          RATE: ${{ inputs.rate || '600' }}
+          DURATION: ${{ inputs.duration || '30s' }}
+        run: scripts/run-scenario.sh
+
+      - name: Summary
+        if: always()
+        run: cat results/*/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results, path: results/ }
